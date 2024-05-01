@@ -6,6 +6,8 @@ import (
 
 func main() {
 
+	initServer()
+
 	el := NewEventLoop(1024, nil, nil)
 
 	laddr, err := net.ResolveTCPAddr("tcp", ":6379")
@@ -25,6 +27,7 @@ func main() {
 		Log("listener get file fd error=%v", err)
 		panic(err)
 	}
+
 	err = el.AddFileEvent(lf, ELMaskReadable, acceptConnection, listener)
 	if err != nil {
 		Log("AddFileEvent error=%v, fd=%d", err, lf.Fd())
@@ -35,29 +38,24 @@ func main() {
 }
 
 func acceptConnection(el *EventLoop, fd int, mask uint8, clientData interface{}) {
-
-	Log("accept new connection")
-
+	Log("accept new connection: fd=%d", fd)
 	listener := clientData.(*net.TCPListener)
 	conn, err := listener.Accept()
 	if err != nil {
 		Log("acceptConnection failed, err=%v", err)
 		return
 	}
-
 	tcpConn := conn.(*net.TCPConn)
-
 	tcpFd, err := tcpConn.File()
-
 	if err != nil {
-		Log("acceptConnection AddFileEvent error=%v", err)
+		Log("acceptConnection get tcp fd error=%v", err)
 		return
 	}
 
-	err = el.AddFileEvent(tcpFd, ELMaskReadable, readData, conn)
-
+	err = CreateClient(el, int(tcpFd.Fd()), tcpConn)
 	if err != nil {
-		Log("readData AddFileEvent error=%v", err)
+		Log("acceptConnection CreateClient error=%v", err)
+		return
 	}
 }
 
