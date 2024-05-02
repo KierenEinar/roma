@@ -22,11 +22,25 @@ const (
 	ReqTypeMultiBulk
 )
 
+const (
+	replyBufferLen = 1024 * 16
+)
+
 func ProcessInlineBuffer(c *Client) bool {
 	return false
 }
 
+func AddReply(c *Client, reply []byte) {
+	c.Reply.Write(reply)
+	if c.ReplyElement != nil {
+		return
+	}
+	server.Replies.PushBack(c)
+	c.ReplyElement = server.Replies.Back()
+}
+
 func AddReplyError(c *Client, err string) {
+
 }
 
 func SetProtocolError(c *Client, err string) {

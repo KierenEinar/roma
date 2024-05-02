@@ -141,11 +141,15 @@ func (el *EventLoop) DelFileEvent(fd int, mask uint8) error {
 	err := el.ElApi.DelFileEvent(fd, mask)
 
 	if fd == el.maxFd {
-		for j := el.maxFd; j >= 0; j++ {
-			if el.Events[j].Mask&(ELMaskReadable|ELMaskWritable) != ELMaskNone {
+		for j := el.maxFd; j >= 0; j-- {
+			if el.Events[j].Mask&(ELMaskReadable|ELMaskWritable) > 0 {
 				el.maxFd = j
 				break
 			}
+		}
+		// current fd is the last one
+		if el.maxFd == fd {
+			el.maxFd = -1
 		}
 	}
 

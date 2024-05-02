@@ -25,6 +25,10 @@ const (
 	objectEncodingRaw = iota
 )
 
+const (
+	clientFlagCloseAfterReply = 1 << 0
+)
+
 type RObj struct {
 	ObjectType uint8
 	Encoding   uint8
@@ -52,15 +56,24 @@ type Client struct {
 	MultiBulkLen int32
 	BulkLen      int64
 
+	Flag int64
+
+	Reply *bytes.Buffer
+	//ReplyList     *list.List
 	ClientElement *list.Element
+	ReplyElement  *list.Element
 }
 
 type Server struct {
 	NextClientId int64
 	Clients      *list.List
+
+	Replies *list.List
+
+	EL *EventLoop
 }
 
-func CreateClient(el *EventLoop, fd int, tcpConn *net.TCPConn) error {
+func CreateClient(el *EventLoop, tcpConn *net.TCPConn) error {
 
 	tcpFd, err := tcpConn.File()
 
@@ -68,6 +81,8 @@ func CreateClient(el *EventLoop, fd int, tcpConn *net.TCPConn) error {
 		Log("acceptConnection AddFileEvent error=%v", err)
 		return err
 	}
+
+	fd := int(tcpFd.Fd())
 
 	client := &Client{
 		Id:           atomic.LoadInt64(&server.NextClientId),
@@ -77,6 +92,8 @@ func CreateClient(el *EventLoop, fd int, tcpConn *net.TCPConn) error {
 		Argv:         make([]RObj, 0),
 		MultiBulkLen: 0,
 		BulkLen:      -1,
+		Reply:        bytes.NewBuffer(nil),
+		//ReplyList:    list.New(),
 	}
 
 	if fd != -1 {
@@ -109,6 +126,21 @@ func CreateClient(el *EventLoop, fd int, tcpConn *net.TCPConn) error {
 
 func FreeClient(client *Client) {
 
+	Log("client closed, fd=%d", client.Fd)
+
+	if err := server.EL.DelFileEvent(client.Fd, ELMaskReadable|ELMaskWritable); err != nil {
+		Log("del client event, fd=%d, err=%v", client.Fd, err)
+	}
+
+	server.Clients.Remove(client.ClientElement)
+	if client.ReplyElement != nil {
+		server.Replies.Remove(client.ReplyElement)
+	}
+
+	_ = client.Conn.Close()
+
+	client.QueryBuf = nil
+	client.Reply = nil
 }
 
 func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData interface{}) {
@@ -156,7 +188,9 @@ func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData interface
 
 }
 
-func initServer() {
+func initServer(el *EventLoop) {
 	server.Clients = list.New()
+	server.Replies = list.New()
 	server.NextClientId = 0
+	server.EL = el
 }
