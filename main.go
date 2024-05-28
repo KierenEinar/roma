@@ -6,7 +6,7 @@ import (
 
 func main() {
 
-	el := NewEventLoop(1024, nil, nil)
+	el := NewEventLoop(1024, beforeSleep, afterSleep)
 	initServer(el)
 
 	laddr, err := net.ResolveTCPAddr("tcp", ":6379")
@@ -43,9 +43,19 @@ func acceptConnection(el *EventLoop, fd int, mask uint8, clientData interface{})
 		return
 	}
 
-	err = CreateClient(el, conn.(*net.TCPConn))
+	err = createClient(el, conn.(*net.TCPConn))
 	if err != nil {
-		Log("acceptConnection CreateClient error=%v", err)
+		Log("acceptConnection createClient error=%v", err)
 		return
 	}
+}
+
+func beforeSleep() {
+
+	handleClientsWithPendingWrite()
+
+}
+
+func afterSleep() {
+
 }

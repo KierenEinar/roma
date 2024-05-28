@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"strconv"
 )
 
@@ -18,40 +19,114 @@ const (
 )
 
 const (
-	ReqTypeInline = iota + 1
-	ReqTypeMultiBulk
+	reqTypeInline = iota + 1
+	reqTypeMultiBulk
 )
 
 const (
 	replyBufferLen = 1024 * 16
 )
 
-func ProcessInlineBuffer(c *Client) bool {
+// client flag
+const (
+	clientSlave           = 1 << 0
+	clientCloseAfterReply = 1 << 6
+	clientPendingWrite    = 1 << 21
+)
+
+func processInlineBuffer(c *client) bool {
 	return false
 }
 
-func AddReply(c *Client, reply []byte) {
-	c.Reply.Write(reply)
-	if c.ReplyElement != nil {
+type bufferBlock struct {
+	len  int
+	pos  int
+	data []byte
+}
+
+func newBufferBlock(len int) *bufferBlock {
+	return &bufferBlock{
+		len:  len,
+		data: make([]byte, len),
+	}
+}
+
+func addReply(c *client, reply []byte) {
+
+	if !prepareClientTotWrite(c) {
 		return
 	}
-	server.Replies.PushBack(c)
-	c.ReplyElement = server.Replies.Back()
+
+	replyLen := len(reply)
+
+	// copy to reply buffer
+	if int(c.replyPos) < len(c.reply) {
+		copyLen := len(c.reply) - int(c.replyPos)
+		if copyLen > replyLen {
+			copyLen = replyLen
+		}
+		copy(c.reply[c.replyPos:], reply[:copyLen])
+		c.replyPos += int64(copyLen)
+		reply = reply[copyLen:]
+		replyLen -= copyLen
+	}
+
+	// copy to reply block list
+	for replyLen > 0 {
+
+		var replyBlock *bufferBlock
+		if c.replyList == nil {
+			replyBlock = newBufferBlock(genericReplyBlockLen)
+			c.replyList = list.New()
+			c.replyList.PushBack(replyBlock)
+		}
+
+		replyBlock = c.replyList.Back().Value.(*bufferBlock)
+		if replyBlock.pos == replyBlock.len {
+			replyBlock = newBufferBlock(genericReplyBlockLen)
+			c.replyList.PushBack(replyBlock)
+		}
+
+		copyLen := replyBlock.len - replyBlock.pos
+		if replyLen < copyLen {
+			copyLen = replyLen
+		}
+
+		copy(replyBlock.data[replyBlock.pos:], reply[:copyLen])
+		replyLen -= copyLen
+		reply = reply[copyLen:]
+	}
+
 }
 
-func AddReplyError(c *Client, err string) {
+func prepareClientTotWrite(c *client) bool {
+
+	if !c.hasPendingOutputs() && c.flag&clientPendingWrite == 0 {
+		c.flag |= clientPendingWrite
+		rServer.ClientsPendingWrite.PushBack(c)
+		c.clientPendingWriteElement = rServer.ClientsPendingWrite.Back()
+	}
+
+	return true
+}
+
+func (c *client) hasPendingOutputs() bool {
+	return c.replyPos > 0 || c.replyList.Len() > 0
+}
+
+func AddReplyError(c *client, err string) {
 
 }
 
-func SetProtocolError(c *Client, err string) {
+func SetProtocolError(c *client, err string) {
 }
 
-func ProcessMultiBulkBuffer(c *Client) bool {
+func ProcessMultiBulkBuffer(c *client) bool {
 
 	pos := 0
-	buf := c.QueryBuf.Bytes()
+	buf := c.queryBuf.Bytes()
 
-	if c.MultiBulkLen == 0 {
+	if c.multiBulkLen == 0 {
 
 		indexAt := bytes.IndexByte(buf, '\r')
 		if indexAt == -1 {
@@ -74,23 +149,23 @@ func ProcessMultiBulkBuffer(c *Client) bool {
 			return false
 		}
 
-		c.MultiBulkLen = int32(multiBulkLen)
+		c.multiBulkLen = int32(multiBulkLen)
 		pos += indexAt + 2
 		buf = buf[pos:]
-		c.QueryBuf.Next(pos)
+		c.queryBuf.Next(pos)
 		pos = 0
 
 		if multiBulkLen <= 0 {
 			return true
 		}
 
-		c.Argv = make([]RObj, multiBulkLen)
+		c.argv = make([]rObj, multiBulkLen)
 
 	}
 
-	for c.MultiBulkLen > 0 {
+	for c.multiBulkLen > 0 {
 
-		if c.BulkLen == -1 {
+		if c.bulkLen == -1 {
 			indexAt := bytes.IndexByte(buf, '\r')
 			if indexAt == -1 {
 				if len(buf) > maxInlineLength {
@@ -123,54 +198,54 @@ func ProcessMultiBulkBuffer(c *Client) bool {
 				return false
 			}
 
-			c.BulkLen = bulkLen
+			c.bulkLen = bulkLen
 			pos += indexAt + 2
 			buf = buf[pos:]
-			c.QueryBuf.Next(pos)
+			c.queryBuf.Next(pos)
 			pos = 0
 
 			if bulkLen >= bulkBigArgs {
-				if bulkLen+2 > int64(c.QueryBuf.Cap()) {
-					c.QueryBuf.Grow(int(bulkLen+2) - c.QueryBuf.Cap())
+				if bulkLen+2 > int64(c.queryBuf.Cap()) {
+					c.queryBuf.Grow(int(bulkLen+2) - c.queryBuf.Cap())
 				}
 			}
 		}
 
-		if c.BulkLen+2 > int64(len(buf)) {
+		if c.bulkLen+2 > int64(len(buf)) {
 			return false
 		} else {
-			c.Argv[c.Argc] = CreateStringObject(buf[:c.BulkLen])
-			pos += int((c.BulkLen) + 2)
+			c.argv[c.argc] = createStringObject(buf[:c.bulkLen])
+			pos += int((c.bulkLen) + 2)
 			buf = buf[pos:]
-			c.QueryBuf.Next(pos)
+			c.queryBuf.Next(pos)
 			pos = 0
-			c.Argc++
-			c.BulkLen = -1
-			c.MultiBulkLen--
+			c.argc++
+			c.bulkLen = -1
+			c.multiBulkLen--
 		}
 	}
 
-	if c.MultiBulkLen == 0 {
+	if c.multiBulkLen == 0 {
 		return true
 	}
 
 	return false
 }
 
-func ProcessInputBuffer(c *Client) {
+func processInputBuffer(c *client) {
 
-	for c.QueryBuf.Len() > 0 {
+	for c.queryBuf.Len() > 0 {
 
-		if c.ReqType == 0 {
-			if c.QueryBuf.Bytes()[0] == '*' {
-				c.ReqType = ReqTypeMultiBulk
+		if c.reqType == 0 {
+			if c.queryBuf.Bytes()[0] == '*' {
+				c.reqType = reqTypeMultiBulk
 			} else {
-				c.ReqType = ReqTypeInline
+				c.reqType = reqTypeInline
 			}
 		}
 
-		if c.ReqType == ReqTypeInline {
-			if !ProcessInlineBuffer(c) {
+		if c.reqType == reqTypeInline {
+			if !processInlineBuffer(c) {
 				break
 			}
 		} else {
@@ -179,7 +254,7 @@ func ProcessInputBuffer(c *Client) {
 			}
 		}
 
-		Log("client get commands, %#v", c.Argv)
+		Log("client get commands, %#v", c.argv)
 	}
 
 }

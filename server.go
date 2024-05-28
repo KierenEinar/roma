@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-var server Server
+var rServer server
 
 const (
 	objectTypeString = iota + 1
@@ -29,51 +29,57 @@ const (
 	clientFlagCloseAfterReply = 1 << 0
 )
 
-type RObj struct {
-	ObjectType uint8
-	Encoding   uint8
-	Data       []byte
+const (
+	genericReplyBlockLen = 1024
+)
+
+type rObj struct {
+	objectType uint8
+	encoding   uint8
+	data       any
 }
 
-func CreateStringObject(data []byte) RObj {
-	return RObj{
-		ObjectType: objectTypeString,
-		Encoding:   objectEncodingRaw,
-		Data:       data,
+func createStringObject(data any) rObj {
+	return rObj{
+		objectType: objectTypeString,
+		encoding:   objectEncodingRaw,
+		data:       data,
 	}
 }
 
-type Client struct {
-	Id       int64
-	Fd       int
-	Conn     *net.TCPConn
-	QueryBuf *bytes.Buffer
+type client struct {
+	id       int64
+	fd       int
+	conn     *net.TCPConn
+	queryBuf *bytes.Buffer
 
-	ReqType int
+	reqType int
 
-	Argv         []RObj
-	Argc         int
-	MultiBulkLen int32
-	BulkLen      int64
+	argv         []rObj
+	argc         int
+	multiBulkLen int32
+	bulkLen      int64
 
-	Flag int64
+	flag int64
 
-	Reply *bytes.Buffer
-	//ReplyList     *list.List
-	ClientElement *list.Element
-	ReplyElement  *list.Element
+	reply                     [genericIOBufferLength]byte
+	replyPos                  int64
+	replyList                 *list.List
+	sentLen                   int64
+	clientElement             *list.Element
+	clientPendingWriteElement *list.Element
 }
 
-type Server struct {
+type server struct {
 	NextClientId int64
 	Clients      *list.List
 
-	Replies *list.List
+	ClientsPendingWrite *list.List
 
 	EL *EventLoop
 }
 
-func CreateClient(el *EventLoop, tcpConn *net.TCPConn) error {
+func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
 
 	tcpFd, err := tcpConn.File()
 
@@ -84,16 +90,14 @@ func CreateClient(el *EventLoop, tcpConn *net.TCPConn) error {
 
 	fd := int(tcpFd.Fd())
 
-	client := &Client{
-		Id:           atomic.LoadInt64(&server.NextClientId),
-		Conn:         tcpConn,
-		Fd:           fd,
-		QueryBuf:     bytes.NewBuffer(nil),
-		Argv:         make([]RObj, 0),
-		MultiBulkLen: 0,
-		BulkLen:      -1,
-		Reply:        bytes.NewBuffer(nil),
-		//ReplyList:    list.New(),
+	client := &client{
+		id:           atomic.LoadInt64(&rServer.NextClientId),
+		conn:         tcpConn,
+		fd:           fd,
+		queryBuf:     bytes.NewBuffer(nil),
+		argv:         make([]rObj, 0),
+		multiBulkLen: 0,
+		bulkLen:      -1,
 	}
 
 	if fd != -1 {
@@ -118,39 +122,41 @@ func CreateClient(el *EventLoop, tcpConn *net.TCPConn) error {
 
 	}
 
-	atomic.AddInt64(&server.NextClientId, 1)
-	server.Clients.PushBack(client)
-	client.ClientElement = server.Clients.Back()
+	atomic.AddInt64(&rServer.NextClientId, 1)
+	rServer.Clients.PushBack(client)
+	client.clientElement = rServer.Clients.Back()
 	return nil
 }
 
-func FreeClient(client *Client) {
+func freeClient(client *client) {
 
-	Log("client closed, fd=%d", client.Fd)
+	Log("client closed, fd=%d", client.fd)
 
-	if err := server.EL.DelFileEvent(client.Fd, ELMaskReadable|ELMaskWritable); err != nil {
-		Log("del client event, fd=%d, err=%v", client.Fd, err)
+	if err := rServer.EL.DelFileEvent(client.fd, ELMaskReadable|ELMaskWritable); err != nil {
+		Log("del client event, fd=%d, err=%v", client.fd, err)
 	}
 
-	server.Clients.Remove(client.ClientElement)
-	if client.ReplyElement != nil {
-		server.Replies.Remove(client.ReplyElement)
+	rServer.Clients.Remove(client.clientElement)
+	if client.clientPendingWriteElement != nil {
+		rServer.ClientsPendingWrite.Remove(client.clientPendingWriteElement)
 	}
 
-	_ = client.Conn.Close()
-
-	client.QueryBuf = nil
-	client.Reply = nil
+	_ = client.conn.Close()
+	client.queryBuf = nil
+	client.argv = nil
+	if client.replyList != nil {
+		client.replyList = nil
+	}
 }
 
 func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData interface{}) {
-	client := clientData.(*Client)
+	client := clientData.(*client)
 	Log("readQueryFromClient fd=%d", fd)
 
 	nRead := genericIOBufferLength
 
-	if client.ReqType == ReqTypeMultiBulk && client.BulkLen != -1 && client.BulkLen >= bulkBigArgs {
-		remaining := int(client.BulkLen) + 2 - client.QueryBuf.Len()
+	if client.reqType == reqTypeMultiBulk && client.bulkLen != -1 && client.bulkLen >= bulkBigArgs {
+		remaining := int(client.bulkLen) + 2 - client.queryBuf.Len()
 		if remaining < nRead {
 			nRead = remaining
 		}
@@ -159,38 +165,137 @@ func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData interface
 	// todo make buffer poolable and reuse
 	buf := make([]byte, nRead)
 
-	read, err := client.Conn.Read(buf)
+	read, err := client.conn.Read(buf)
 
 	if err != nil {
 		if err == io.EOF || errors.Is(err, syscall.EINVAL) {
-			FreeClient(client)
+			freeClient(client)
 			return
 		}
 		Log("try to Read From Connection error=%v", err)
 		return
 	}
 
-	_, err = client.QueryBuf.Write(buf[:read])
+	_, err = client.queryBuf.Write(buf[:read])
 
 	if err != nil {
 		Log("write data from connection error=%v", err)
-		FreeClient(client)
+		freeClient(client)
 		return
 	}
 
-	if client.QueryBuf.Len() > clientMaxQueryBufLen {
+	if client.queryBuf.Len() > clientMaxQueryBufLen {
 		// todo reply error.
-		FreeClient(client)
+		freeClient(client)
 		return
 	}
 
-	ProcessInputBuffer(client)
+	processInputBuffer(client)
 
 }
 
 func initServer(el *EventLoop) {
-	server.Clients = list.New()
-	server.Replies = list.New()
-	server.NextClientId = 0
-	server.EL = el
+	rServer.Clients = list.New()
+	rServer.ClientsPendingWrite = list.New()
+	rServer.NextClientId = 0
+	rServer.EL = el
+}
+
+func handleClientsWithPendingWrite() {
+
+	for rServer.ClientsPendingWrite.Len() > 0 {
+
+		c := rServer.ClientsPendingWrite.Front().Value.(*client)
+		c.flag ^= clientPendingWrite
+		rServer.ClientsPendingWrite.Remove(c.clientPendingWriteElement)
+		if err := c.writeToClient(false); err != nil {
+			continue
+		}
+
+		if c.hasPendingOutputs() {
+			f, err := c.conn.File()
+			if err != nil {
+				freeClient(c)
+				continue
+			}
+			err = rServer.EL.AddFileEvent(f, ELMaskWritable, c.sendReplyToClient, c)
+			if err != nil {
+				freeClient(c)
+				continue
+			}
+		}
+
+	}
+
+}
+
+func (c *client) sendReplyToClient(el *EventLoop, fd int, mask uint8, clientData any) {
+	_ = c.writeToClient(true)
+}
+
+func (c *client) writeToClient(handleInstalled bool) error {
+
+	var nWritten int
+	var err error
+
+	defer func() {
+		if err != nil {
+			freeClient(c)
+		}
+	}()
+
+	for c.hasPendingOutputs() {
+
+		if c.replyPos > 0 {
+			nWritten, err = c.conn.Write(c.reply[c.sentLen:c.replyPos])
+			if err != nil {
+				return err
+			}
+			c.sentLen += int64(nWritten)
+			if c.sentLen == c.replyPos {
+				c.sentLen = 0
+				c.replyPos = 0
+			}
+		} else if c.replyList != nil {
+
+			block := c.replyList.Front().Value.(*bufferBlock)
+
+			if block.len == 0 {
+				c.replyList.Remove(c.replyList.Front())
+				continue
+			}
+
+			nWritten, err = c.conn.Write(block.data[int(c.sentLen):block.pos])
+			if err != nil {
+				return err
+			}
+
+			c.sentLen += int64(nWritten)
+			if c.sentLen == int64(block.pos) {
+				c.sentLen = 0
+				c.replyList.Remove(c.replyList.Front())
+			}
+
+		}
+	}
+
+	if !c.hasPendingOutputs() {
+
+		c.sentLen = 0
+
+		if handleInstalled {
+			err = rServer.EL.DelFileEvent(c.fd, ELMaskWritable)
+			if err != nil {
+				return err
+			}
+		}
+
+		if c.flag&clientCloseAfterReply > 0 {
+			return errors.New("client close after reply")
+		}
+
+	}
+
+	return nil
+
 }
