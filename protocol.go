@@ -103,8 +103,8 @@ func prepareClientTotWrite(c *client) bool {
 
 	if !c.hasPendingOutputs() && c.flag&clientPendingWrite == 0 {
 		c.flag |= clientPendingWrite
-		rServer.ClientsPendingWrite.PushBack(c)
-		c.clientPendingWriteElement = rServer.ClientsPendingWrite.Back()
+		rServer.clientsPendingWrite.PushBack(c)
+		c.clientPendingWriteElement = rServer.clientsPendingWrite.Back()
 	}
 
 	return true
@@ -114,115 +114,130 @@ func (c *client) hasPendingOutputs() bool {
 	return c.replyPos > 0 || c.replyList.Len() > 0
 }
 
-func AddReplyError(c *client, err string) {
+func addReplyError(c *client, err string) {
 
 }
 
-func SetProtocolError(c *client, err string) {
+func setProtocolError(c *client, err string) {
+	// todo log
+	c.flag |= clientCloseAfterReply
+	c.queryBuf = c.queryBuf[:0]
 }
 
-func ProcessMultiBulkBuffer(c *client) bool {
+func processMultiBulkBuffer(c *client) bool {
 
 	pos := 0
-	buf := c.queryBuf.Bytes()
-
 	if c.multiBulkLen == 0 {
-
-		indexAt := bytes.IndexByte(buf, '\r')
-		if indexAt == -1 {
-			if len(buf) > maxInlineLength {
-				AddReplyError(c, "query buf inline length too long.")
-				SetProtocolError(c, "invalid inline length")
+		idx := bytes.IndexByte(c.queryBuf, '\r')
+		if idx == -1 {
+			if len(c.queryBuf) >= maxInlineLength {
+				addReplyError(c, "Protocol error: too big mbulk count string")
+				setProtocolError(c, "too big mbulk count string")
 			}
 			return false
 		}
 
-		// also need contains \n
-		if indexAt+1 > len(buf)-1 {
+		if c.queryBuf[0] != '*' {
+			addReplyError(c, "Protocol error: mbulk string must start with *")
+			setProtocolError(c, "mbulk string must start with *")
 			return false
 		}
 
-		multiBulkLen, err := strconv.ParseInt(string(buf[1:indexAt]), 10, 32)
-		if err != nil || multiBulkLen > 1024*1024 {
-			AddReplyError(c, "invalid multi bulk length")
-			SetProtocolError(c, "invalid multi bulk length")
+		// should contains \n
+		if idx+2 > len(c.queryBuf) {
 			return false
 		}
 
-		c.multiBulkLen = int32(multiBulkLen)
-		pos += indexAt + 2
-		buf = buf[pos:]
-		c.queryBuf.Next(pos)
-		pos = 0
-
-		if multiBulkLen <= 0 {
-			return true
+		mbulk, err := strconv.ParseInt(string(c.queryBuf[1:idx]), 10, 64)
+		if err != nil {
+			addReplyError(c, "Protocol error: mbulk count invalid")
+			setProtocolError(c, "mbulk count invalid")
+			return false
 		}
 
-		c.argv = make([]rObj, multiBulkLen)
+		pos += idx + 2
+		if mbulk <= 0 {
+			c.queryBuf = c.queryBuf[pos:]
+			return false
+		}
+		c.multiBulkLen = int32(mbulk)
 
+		c.argv = make([]rObj, mbulk)
+		c.argc = 0
 	}
 
 	for c.multiBulkLen > 0 {
 
 		if c.bulkLen == -1 {
-			indexAt := bytes.IndexByte(buf, '\r')
-			if indexAt == -1 {
-				if len(buf) > maxInlineLength {
-					AddReplyError(c, "query buf inline length too long.")
-					SetProtocolError(c, "invalid inline length")
+			idx := bytes.IndexByte(c.queryBuf[pos:], '\r')
+			if idx == -1 {
+				if len(c.queryBuf) >= maxInlineLength {
+					addReplyError(c, "Protocol error: too big bulk count string")
+					setProtocolError(c, "too big mbulk count string")
 				}
 				return false
 			}
 
-			if indexAt+1 > len(buf)-1 {
+			// should contain \n
+			if pos+idx+2 > len(c.queryBuf) {
+				break
+			}
+
+			if c.queryBuf[pos] != '$' {
+				addReplyError(c, "Protocol error: bulk string must start with $")
+				setProtocolError(c, "bulk string must start with $")
 				return false
 			}
 
-			if buf[0] != '$' {
-				AddReplyError(c, "bulk must start with $")
-				SetProtocolError(c, "bulk must start with $")
-				return false
-			}
-
-			bulkLen, err := strconv.ParseInt(string(buf[1:indexAt]), 10, 64)
+			bulk, err := strconv.ParseInt(string(c.queryBuf[pos+1:pos+idx]), 10, 64)
 			if err != nil {
-				AddReplyError(c, "invalid bulk length")
-				SetProtocolError(c, "invalid bulk length")
+				addReplyError(c, "Protocol error: bulk len invalid")
+				setProtocolError(c, "bulk len invalid")
 				return false
 			}
 
-			if bulkLen > maxBulkLen || bulkLen < 0 {
-				AddReplyError(c, "invalid bulk length")
-				SetProtocolError(c, "invalid bulk length")
+			if bulk < 0 || bulk > maxBulkLen {
+				addReplyError(c, "Protocol error: bulk len exceed max len 512MB")
+				setProtocolError(c, "bulk len exceed max len 512MB")
 				return false
 			}
 
-			c.bulkLen = bulkLen
-			pos += indexAt + 2
-			buf = buf[pos:]
-			c.queryBuf.Next(pos)
-			pos = 0
-
-			if bulkLen >= bulkBigArgs {
-				if bulkLen+2 > int64(c.queryBuf.Cap()) {
-					c.queryBuf.Grow(int(bulkLen+2) - c.queryBuf.Cap())
+			c.bulkLen = bulk
+			pos += idx + 2
+			if bulk >= bulkBigArgs {
+				c.queryBuf = c.queryBuf[pos:]
+				pos = 0
+				if cap(c.queryBuf)-len(c.queryBuf) < bulkBigArgs+2 {
+					newBuffer := make([]byte, 0, bulkBigArgs+2)
+					newBuffer = append(newBuffer, c.queryBuf...)
+					c.queryBuf = newBuffer
 				}
 			}
+
 		}
 
-		if c.bulkLen+2 > int64(len(buf)) {
-			return false
-		} else {
-			c.argv[c.argc] = createStringObject(buf[:c.bulkLen])
-			pos += int((c.bulkLen) + 2)
-			buf = buf[pos:]
-			c.queryBuf.Next(pos)
-			pos = 0
-			c.argc++
-			c.bulkLen = -1
-			c.multiBulkLen--
+		if c.bulkLen+2 > int64(len(c.queryBuf[pos:])) {
+			break
 		}
+
+		c.argv[c.argc] = rObj{
+			objectType: objectTypeString,
+			encoding:   objectEncodingRaw,
+			data:       c.queryBuf[:c.bulkLen],
+		}
+
+		if c.bulkLen >= bulkBigArgs && pos == 0 &&
+			int64(len(c.queryBuf)) == c.bulkLen+2 {
+			c.queryBuf = make([]byte, 0, genericIOBufferLength)
+		} else {
+			pos += int(c.bulkLen) + 2
+		}
+		c.bulkLen--
+		c.multiBulkLen--
+	}
+
+	if pos > 0 {
+		c.queryBuf = c.queryBuf[pos:]
 	}
 
 	if c.multiBulkLen == 0 {
@@ -234,10 +249,10 @@ func ProcessMultiBulkBuffer(c *client) bool {
 
 func processInputBuffer(c *client) {
 
-	for c.queryBuf.Len() > 0 {
+	for len(c.queryBuf) > 0 {
 
 		if c.reqType == 0 {
-			if c.queryBuf.Bytes()[0] == '*' {
+			if c.queryBuf[0] == '*' {
 				c.reqType = reqTypeMultiBulk
 			} else {
 				c.reqType = reqTypeInline
@@ -249,12 +264,15 @@ func processInputBuffer(c *client) {
 				break
 			}
 		} else {
-			if !ProcessMultiBulkBuffer(c) {
+			if !processMultiBulkBuffer(c) {
 				break
 			}
 		}
 
 		Log("client get commands, %#v", c.argv)
+
+		processCommand(c)
+
 	}
 
 }

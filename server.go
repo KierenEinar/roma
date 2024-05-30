@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"container/list"
 	"errors"
 	"golang.org/x/sys/unix"
@@ -23,6 +22,7 @@ const (
 
 const (
 	objectEncodingRaw = iota
+	objectEncodingEmbedding
 )
 
 const (
@@ -51,7 +51,7 @@ type client struct {
 	id       int64
 	fd       int
 	conn     *net.TCPConn
-	queryBuf *bytes.Buffer
+	queryBuf []byte
 
 	reqType int
 
@@ -71,12 +71,12 @@ type client struct {
 }
 
 type server struct {
-	NextClientId int64
-	Clients      *list.List
+	nextClientId int64
+	clients      *list.List
 
-	ClientsPendingWrite *list.List
+	clientsPendingWrite *list.List
 
-	EL *EventLoop
+	el *EventLoop
 }
 
 func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
@@ -91,10 +91,10 @@ func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
 	fd := int(tcpFd.Fd())
 
 	client := &client{
-		id:           atomic.LoadInt64(&rServer.NextClientId),
+		id:           atomic.LoadInt64(&rServer.nextClientId),
 		conn:         tcpConn,
 		fd:           fd,
-		queryBuf:     bytes.NewBuffer(nil),
+		queryBuf:     make([]byte, 0, genericIOBufferLength),
 		argv:         make([]rObj, 0),
 		multiBulkLen: 0,
 		bulkLen:      -1,
@@ -122,92 +122,86 @@ func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
 
 	}
 
-	atomic.AddInt64(&rServer.NextClientId, 1)
-	rServer.Clients.PushBack(client)
-	client.clientElement = rServer.Clients.Back()
+	atomic.AddInt64(&rServer.nextClientId, 1)
+	rServer.clients.PushBack(client)
+	client.clientElement = rServer.clients.Back()
 	return nil
 }
 
-func freeClient(client *client) {
+func freeClient(c *client) {
 
-	Log("client closed, fd=%d", client.fd)
+	Log("client closed, fd=%d", c.fd)
 
-	if err := rServer.EL.DelFileEvent(client.fd, ELMaskReadable|ELMaskWritable); err != nil {
-		Log("del client event, fd=%d, err=%v", client.fd, err)
+	if err := rServer.el.DelFileEvent(c.fd, ELMaskReadable|ELMaskWritable); err != nil {
+		Log("del client event, fd=%d, err=%v", c.fd, err)
 	}
 
-	rServer.Clients.Remove(client.clientElement)
-	if client.clientPendingWriteElement != nil {
-		rServer.ClientsPendingWrite.Remove(client.clientPendingWriteElement)
+	rServer.clients.Remove(c.clientElement)
+	if c.clientPendingWriteElement != nil {
+		rServer.clientsPendingWrite.Remove(c.clientPendingWriteElement)
 	}
 
-	_ = client.conn.Close()
-	client.queryBuf = nil
-	client.argv = nil
-	if client.replyList != nil {
-		client.replyList = nil
+	_ = c.conn.Close()
+	c.argv = nil
+	if c.replyList != nil {
+		c.replyList = nil
 	}
+
+	c.queryBuf = c.queryBuf[:0]
 }
 
-func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData interface{}) {
-	client := clientData.(*client)
+func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData any) {
+	c := clientData.(*client)
 	Log("readQueryFromClient fd=%d", fd)
 
 	nRead := genericIOBufferLength
 
-	if client.reqType == reqTypeMultiBulk && client.bulkLen != -1 && client.bulkLen >= bulkBigArgs {
-		remaining := int(client.bulkLen) + 2 - client.queryBuf.Len()
+	if c.reqType == reqTypeMultiBulk && c.bulkLen != -1 && c.bulkLen >= bulkBigArgs {
+		remaining := int(c.bulkLen) + 2 - len(c.queryBuf)
 		if remaining < nRead {
 			nRead = remaining
 		}
 	}
 
-	// todo make buffer poolable and reuse
 	buf := make([]byte, nRead)
 
-	read, err := client.conn.Read(buf)
+	read, err := c.conn.Read(buf)
 
 	if err != nil {
 		if err == io.EOF || errors.Is(err, syscall.EINVAL) {
-			freeClient(client)
+			freeClient(c)
 			return
 		}
 		Log("try to Read From Connection error=%v", err)
 		return
 	}
 
-	_, err = client.queryBuf.Write(buf[:read])
+	c.queryBuf = append(c.queryBuf, buf[:read]...)
 
-	if err != nil {
-		Log("write data from connection error=%v", err)
-		freeClient(client)
+	if len(c.queryBuf) > clientMaxQueryBufLen {
+		addReplyError(c, "invalid query buf length")
+		setProtocolError(c, "query buf too long")
 		return
 	}
 
-	if client.queryBuf.Len() > clientMaxQueryBufLen {
-		// todo reply error.
-		freeClient(client)
-		return
-	}
-
-	processInputBuffer(client)
+	processInputBuffer(c)
 
 }
 
 func initServer(el *EventLoop) {
-	rServer.Clients = list.New()
-	rServer.ClientsPendingWrite = list.New()
-	rServer.NextClientId = 0
-	rServer.EL = el
+	rServer.clients = list.New()
+	rServer.clientsPendingWrite = list.New()
+	rServer.nextClientId = 0
+	rServer.el = el
 }
 
 func handleClientsWithPendingWrite() {
 
-	for rServer.ClientsPendingWrite.Len() > 0 {
+	for rServer.clientsPendingWrite.Len() > 0 {
 
-		c := rServer.ClientsPendingWrite.Front().Value.(*client)
+		c := rServer.clientsPendingWrite.Front().Value.(*client)
 		c.flag ^= clientPendingWrite
-		rServer.ClientsPendingWrite.Remove(c.clientPendingWriteElement)
+		rServer.clientsPendingWrite.Remove(c.clientPendingWriteElement)
 		if err := c.writeToClient(false); err != nil {
 			continue
 		}
@@ -218,7 +212,7 @@ func handleClientsWithPendingWrite() {
 				freeClient(c)
 				continue
 			}
-			err = rServer.EL.AddFileEvent(f, ELMaskWritable, c.sendReplyToClient, c)
+			err = rServer.el.AddFileEvent(f, ELMaskWritable, c.sendReplyToClient, c)
 			if err != nil {
 				freeClient(c)
 				continue
@@ -284,7 +278,7 @@ func (c *client) writeToClient(handleInstalled bool) error {
 		c.sentLen = 0
 
 		if handleInstalled {
-			err = rServer.EL.DelFileEvent(c.fd, ELMaskWritable)
+			err = rServer.el.DelFileEvent(c.fd, ELMaskWritable)
 			if err != nil {
 				return err
 			}
@@ -297,5 +291,9 @@ func (c *client) writeToClient(handleInstalled bool) error {
 	}
 
 	return nil
+
+}
+
+func processCommand(c *client) {
 
 }
