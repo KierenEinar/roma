@@ -287,26 +287,29 @@ walk:
 				tsr = true
 				return
 			}
-			// /config/:name
-			// /config/:name/abc
-			// /config/:name/ccc
+
 			if path == "/" && n.nType == nStatic {
 				tsr = true
 				return
 			}
 
-			for ix := range n.children {
-				if n.children[ix].path == "/" && n.children[ix].handler != nil {
-					tsr = true
-					return
+			for ix, c := range n.indices {
+
+				n = n.children[ix]
+				if byte(c) == '/' {
+					if (len(n.path) == 1 && n.handler != nil) ||
+						(n.wildChild && n.children[0].nType == nCatchAll && n.children[0].handler != nil) {
+						tsr = true
+						return
+					}
 				}
 			}
 
 			return
 		}
 
-		tsr = path == "/" || (len(path) < len(n.path) && path == n.path[:len(path)] &&
-			n.path[len(path):] == "/" && n.handler != nil)
+		tsr = path == "/" || (len(n.path) == len(path)+1 && n.path[len(path)] == '/' &&
+			n.path[:len(path)] == path && n.handler != nil)
 
 		return
 
