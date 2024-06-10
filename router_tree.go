@@ -207,7 +207,6 @@ func (n *routerNode) getValue(fullPath string) (h handler, ps []params, tsr bool
 walk:
 
 	path := fullPath
-
 	for {
 
 		if len(path) > len(n.path) {
