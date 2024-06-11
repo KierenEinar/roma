@@ -90,7 +90,7 @@ func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
 
 	fd := int(tcpFd.Fd())
 
-	client := &client{
+	c := &client{
 		id:           atomic.LoadInt64(&rServer.nextClientId),
 		conn:         tcpConn,
 		fd:           fd,
@@ -113,7 +113,7 @@ func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
 			Log("SetNonblock error=%v,  fd=%d", err, tcpFd.Fd())
 		}
 
-		err = el.AddFileEvent(tcpFd, ELMaskReadable, readQueryFromClient, client)
+		err = el.AddFileEvent(tcpFd, ELMaskReadable, readQueryFromClient, c)
 		if err != nil {
 			Log("readData AddFileEvent error=%v", err)
 			_ = tcpConn.Close()
@@ -123,8 +123,8 @@ func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
 	}
 
 	atomic.AddInt64(&rServer.nextClientId, 1)
-	rServer.clients.PushBack(client)
-	client.clientElement = rServer.clients.Back()
+	rServer.clients.PushBack(c)
+	c.clientElement = rServer.clients.Back()
 	return nil
 }
 
@@ -295,5 +295,14 @@ func (c *client) writeToClient(handleInstalled bool) error {
 }
 
 func processCommand(c *client) {
+
+}
+
+func resetClient(c *client) {
+
+	c.argc = 0
+	c.argv = nil
+	c.multiBulkLen = 0
+	c.bulkLen = -1
 
 }

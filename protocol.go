@@ -271,7 +271,11 @@ func processInputBuffer(c *client) {
 
 		Log("client get commands, %#v", c.argv)
 
-		processCommand(c)
+		if c.argc == 0 {
+			resetClient(c)
+		} else {
+			processCommand(c)
+		}
 
 	}
 

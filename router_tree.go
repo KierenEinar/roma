@@ -88,9 +88,9 @@ func (n *routerNode) insertChild(path string, h handler) {
 			panic("only one params pattern path allow in per segment")
 		}
 
+		n.wildChild = true
 		if start > 0 {
 			n.path = path[:start]
-			n.wildChild = true
 			n.nType = nStatic
 			n.indices = ""
 		}
@@ -114,7 +114,8 @@ func (n *routerNode) insertChild(path string, h handler) {
 		path = path[start+len(wilcard):]
 
 		if len(path) == 0 {
-			break
+			n.handler = h
+			return
 		}
 
 		if path[0] != '*' && path[0] != ':' {
@@ -204,24 +205,23 @@ walk:
 
 func (n *routerNode) getValue(fullPath string) (h handler, ps []params, tsr bool) {
 
-walk:
-
 	path := fullPath
+walk:
 	for {
 
 		if len(path) > len(n.path) {
 
-			idxc := path[0]
 			if path[:len(n.path)] == n.path {
 				if !n.wildChild {
+					path = path[len(n.path):]
+					idxc := path[0]
 					for ix, c := range n.indices {
 						if byte(c) == idxc {
-							path = path[len(n.path):]
 							n = n.children[ix]
 							continue walk
 						}
 					}
-					tsr = len(path) == len(n.path)+1 && idxc == '/' && n.handler != nil
+					tsr = path == "/" && n.indices == "" && n.handler != nil
 					return
 				}
 
@@ -282,6 +282,15 @@ walk:
 				return
 			}
 
+			if n.wildChild && n.children[0].nType == nCatchAll {
+				h = n.children[0].handler
+				ps = append(ps, params{
+					param: "/",
+					value: n.children[0].path,
+				})
+				return
+			}
+
 			if path == "/" && n.wildChild && n.nType != nRoot {
 				tsr = true
 				return
@@ -294,10 +303,10 @@ walk:
 
 			for ix, c := range n.indices {
 
-				n = n.children[ix]
+				child := n.children[ix]
 				if byte(c) == '/' {
-					if (len(n.path) == 1 && n.handler != nil) ||
-						(n.wildChild && n.children[0].nType == nCatchAll && n.children[0].handler != nil) {
+					if (len(child.path) == 1 && child.handler != nil) ||
+						(child.wildChild && child.children[0].nType == nCatchAll && child.children[0].handler != nil) {
 						tsr = true
 						return
 					}
