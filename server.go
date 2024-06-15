@@ -263,6 +263,14 @@ func initThreadIO(ctx context.Context) {
 		rServer.readWriteIOList[ix] = list.New()
 	}
 
+	for ix := 0; ix < rServer.numConcurrenceReadWrite; ix++ {
+		rServer.readWriteIORecvChannels[ix] = make(chan chan struct{})
+	}
+
+	for ix := 0; ix < rServer.numConcurrenceReadWrite; ix++ {
+		rServer.readWriteIOSendChannels[ix] = make(chan struct{})
+	}
+
 	for i := 0; i < rServer.numConcurrenceReadWrite; i++ {
 		go readWriteIO(ctx, i)
 	}
