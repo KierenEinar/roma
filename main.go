@@ -52,6 +52,8 @@ func acceptConnection(el *EventLoop, fd int, mask uint8, clientData interface{})
 
 func beforeSleep() {
 
+	handleClientsWithPendingRead()
+
 	handleClientsWithPendingWrite()
 
 }

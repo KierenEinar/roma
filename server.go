@@ -2,10 +2,12 @@ package main
 
 import (
 	"container/list"
+	"context"
 	"errors"
 	"golang.org/x/sys/unix"
 	"io"
 	"net"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 )
@@ -31,6 +33,10 @@ const (
 
 const (
 	genericReplyBlockLen = 1024
+)
+
+const (
+	enableAsyncRWMinCPUS = 4
 )
 
 type rObj struct {
@@ -74,7 +80,18 @@ type server struct {
 	nextClientId int64
 	clients      *list.List
 
-	clientsPendingWrite *list.List
+	clientsPendingWrite     *list.List
+	clientsPendingRead      *list.List
+	activeAsyncReadWrite    bool // is server in async read mode
+	numConcurrenceReadWrite int  // num of goroutines in async read
+
+	readWriteThreadActive   bool
+	readWriteIOList         []*list.List
+	readWriteIORecvChannels []chan chan struct{}
+	readWriteIOSendChannels []chan struct{}
+	ioRead                  bool
+
+	stop func()
 
 	el *EventLoop
 }
@@ -113,7 +130,7 @@ func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
 			Log("SetNonblock error=%v,  fd=%d", err, tcpFd.Fd())
 		}
 
-		err = el.AddFileEvent(tcpFd, ELMaskReadable, readQueryFromClient, c)
+		err = el.AddFileEvent(tcpFd, ELMaskReadable, acceptHandle, c)
 		if err != nil {
 			Log("readData AddFileEvent error=%v", err)
 			_ = tcpConn.Close()
@@ -150,9 +167,18 @@ func freeClient(c *client) {
 	c.queryBuf = c.queryBuf[:0]
 }
 
-func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData any) {
+func acceptHandle(el *EventLoop, fd int, mask uint8, clientData any) {
 	c := clientData.(*client)
-	Log("readQueryFromClient fd=%d", fd)
+	readQueryFromClient(c)
+}
+
+func readQueryFromClient(c *client) {
+
+	if postponeClientRead(c) {
+		return
+	}
+
+	Log("readQueryFromClient fd=%d", c.fd)
 
 	nRead := genericIOBufferLength
 
@@ -189,10 +215,134 @@ func readQueryFromClient(el *EventLoop, fd int, mask uint8, clientData any) {
 }
 
 func initServer(el *EventLoop) {
+	ctx, cancel := context.WithCancel(context.Background())
+	rServer.stop = cancel
 	rServer.clients = list.New()
 	rServer.clientsPendingWrite = list.New()
+	rServer.clientsPendingRead = list.New()
 	rServer.nextClientId = 0
+
+	cpus := runtime.NumCPU()
+	if cpus >= enableAsyncRWMinCPUS {
+		rServer.activeAsyncReadWrite = true
+		rServer.numConcurrenceReadWrite = cpus / 2
+	}
+
 	rServer.el = el
+	initThreadIO(ctx)
+
+}
+
+func postponeClientRead(c *client) bool {
+
+	if !rServer.readWriteThreadActive {
+		return false
+	}
+
+	if c.flag&clientPendingRead == 0 {
+		c.flag |= clientPendingRead
+		rServer.clientsPendingRead.PushBack(c)
+		return true
+	}
+
+	return false
+}
+
+func initThreadIO(ctx context.Context) {
+
+	if !rServer.activeAsyncReadWrite {
+		return
+	}
+
+	rServer.readWriteThreadActive = false
+	rServer.readWriteIOList = make([]*list.List, rServer.numConcurrenceReadWrite)
+	rServer.readWriteIORecvChannels = make([]chan chan struct{}, rServer.numConcurrenceReadWrite)
+	rServer.readWriteIOSendChannels = make([]chan struct{}, rServer.numConcurrenceReadWrite)
+
+	for ix := 0; ix < rServer.numConcurrenceReadWrite; ix++ {
+		rServer.readWriteIOList[ix] = list.New()
+	}
+
+	for i := 0; i < rServer.numConcurrenceReadWrite; i++ {
+		go readWriteIO(ctx, i)
+	}
+
+	rServer.readWriteThreadActive = true
+
+}
+
+func readWriteIO(ctx context.Context, ioId int) {
+
+	for {
+
+		select {
+		case <-ctx.Done():
+			return
+		case ch := <-rServer.readWriteIORecvChannels[ioId]:
+
+			ioList := rServer.readWriteIOList[ioId]
+			for ele := ioList.Front(); ele != nil; ele = ele.Next() {
+				c := ioList.Remove(ele).(*client)
+				if rServer.ioRead {
+					readQueryFromClient(c)
+				}
+			}
+			ch <- struct{}{} // notify main thread finished.
+		}
+
+	}
+
+}
+
+func handleClientsWithPendingRead() {
+
+	if !rServer.activeAsyncReadWrite {
+		return
+	}
+
+	if rServer.clientsPendingRead.Len() == 0 {
+		return
+	}
+
+	for ix := 0; ix < rServer.clientsPendingRead.Len(); ix++ {
+		ele := rServer.clientsPendingRead.Front()
+		c := ele.Value.(*client)
+		rServer.readWriteIOList[ix%rServer.numConcurrenceReadWrite].PushBack(c)
+	}
+
+	rServer.ioRead = true
+
+	for ix := 1; ix < rServer.numConcurrenceReadWrite; ix++ {
+		rServer.readWriteIORecvChannels[ix] <- rServer.readWriteIOSendChannels[ix]
+	}
+
+	for rServer.readWriteIOList[0].Len() > 0 {
+		ele := rServer.readWriteIOList[0].Front()
+		c := ele.Value.(*client)
+		rServer.readWriteIOList[0].Remove(ele)
+
+		readQueryFromClient(c)
+	}
+
+	// wait all goroutine to finished.
+	for ix := 1; ix < rServer.numConcurrenceReadWrite; ix++ {
+		<-rServer.readWriteIOSendChannels[ix]
+	}
+
+	for ele := rServer.clientsPendingRead.Front(); ele != nil; ele = ele.Next() {
+
+		c := ele.Value.(*client)
+		c.flag ^= clientPendingRead
+		rServer.clientsPendingRead.Remove(ele)
+		if c.flag&clientPendingCommand > 0 {
+			c.flag ^= clientPendingCommand
+			if !processCommandAndResetClient(c) {
+				continue
+			}
+		}
+		processInputBuffer(c)
+	}
+
 }
 
 func handleClientsWithPendingWrite() {
@@ -294,8 +444,8 @@ func (c *client) writeToClient(handleInstalled bool) error {
 
 }
 
-func processCommand(c *client) {
-
+func processCommandAndResetClient(c *client) bool {
+	return false
 }
 
 func resetClient(c *client) {
@@ -304,5 +454,6 @@ func resetClient(c *client) {
 	c.argv = nil
 	c.multiBulkLen = 0
 	c.bulkLen = -1
+	c.flag = 0
 
 }

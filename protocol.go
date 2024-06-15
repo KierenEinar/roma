@@ -32,6 +32,8 @@ const (
 	clientSlave           = 1 << 0
 	clientCloseAfterReply = 1 << 6
 	clientPendingWrite    = 1 << 21
+	clientPendingRead     = 1 << 22
+	clientPendingCommand  = 1 << 23
 )
 
 func processInlineBuffer(c *client) bool {
@@ -274,7 +276,16 @@ func processInputBuffer(c *client) {
 		if c.argc == 0 {
 			resetClient(c)
 		} else {
-			processCommand(c)
+
+			if c.flag&clientPendingRead > 0 {
+				c.flag |= clientPendingCommand
+				break
+			}
+
+			if !processCommandAndResetClient(c) {
+				return
+			}
+
 		}
 
 	}
