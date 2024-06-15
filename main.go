@@ -2,6 +2,9 @@ package main
 
 import (
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -31,7 +34,16 @@ func main() {
 		panic(err)
 	}
 
-	el.Main()
+	go func() {
+		el.Serve()
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Kill, os.Interrupt, syscall.SIGTERM)
+	<-sig
+
+	terminate(el)
+
 }
 
 func acceptConnection(el *EventLoop, fd int, mask uint8, clientData interface{}) {
@@ -59,5 +71,27 @@ func beforeSleep() {
 }
 
 func afterSleep() {
+
+}
+
+func terminate(el *EventLoop) {
+
+	el.StopAndWait()
+
+	Log("roma server terminate start.")
+
+	rServer.stop()
+
+	// todo close clients..
+
+	// todo save rdb
+
+	// todo save aof
+
+	// wait io threads
+
+	rServer.closeReadWriteIOs.Wait()
+
+	Log("roma server terminate finished")
 
 }

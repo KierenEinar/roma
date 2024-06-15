@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 )
@@ -91,9 +92,10 @@ type server struct {
 	readWriteIOSendChannels []chan struct{}
 	ioRead                  bool
 
-	stop func()
-
-	el *EventLoop
+	// shutdown handler
+	stop              func()
+	closeReadWriteIOs sync.WaitGroup
+	el                *EventLoop
 }
 
 func createClient(el *EventLoop, tcpConn *net.TCPConn) error {
@@ -230,7 +232,6 @@ func initServer(el *EventLoop) {
 
 	rServer.el = el
 	initThreadIO(ctx)
-
 }
 
 func postponeClientRead(c *client) bool {
@@ -258,7 +259,7 @@ func initThreadIO(ctx context.Context) {
 	rServer.readWriteIOList = make([]*list.List, rServer.numConcurrenceReadWrite)
 	rServer.readWriteIORecvChannels = make([]chan chan struct{}, rServer.numConcurrenceReadWrite)
 	rServer.readWriteIOSendChannels = make([]chan struct{}, rServer.numConcurrenceReadWrite)
-
+	rServer.closeReadWriteIOs.Add(rServer.numConcurrenceReadWrite)
 	for ix := 0; ix < rServer.numConcurrenceReadWrite; ix++ {
 		rServer.readWriteIOList[ix] = list.New()
 	}
@@ -285,6 +286,7 @@ func readWriteIO(ctx context.Context, ioId int) {
 
 		select {
 		case <-ctx.Done():
+			rServer.closeReadWriteIOs.Done()
 			return
 		case ch := <-rServer.readWriteIORecvChannels[ioId]:
 

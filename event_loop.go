@@ -49,7 +49,7 @@ type EventLoop struct {
 	BeforeSleep ProcBeforeSleep
 	AfterSleep  ProcAfterSleep
 
-	Stop  bool
+	Stop  chan chan struct{}
 	maxFd int
 }
 
@@ -77,27 +77,37 @@ func NewEventLoop(setSize int, beforeSleep ProcBeforeSleep, afterSleep ProcAfter
 		NextTimerId: 0,
 		BeforeSleep: beforeSleep,
 		AfterSleep:  afterSleep,
-		Stop:        false,
+		Stop:        make(chan chan struct{}),
 		maxFd:       -1,
 	}
 	el.ElApi = NewEventLoopSelector(el, setSize)
 	return el
 }
 
-func (el *EventLoop) Main() {
+func (el *EventLoop) Serve() {
 
-	for !el.Stop {
-		if el.BeforeSleep != nil {
-			el.BeforeSleep()
-		}
-		_, err := el.poll(ELFlagsAllEvents | ELFlagsNoWait | ELFlagsBarrier)
-		if err != nil {
-			Log("poll error", err)
-		}
-		if el.AfterSleep != nil {
-			el.AfterSleep()
+	Log("EventLoop start...")
+
+	for {
+		select {
+		case c := <-el.Stop:
+			Log("EventLoop stop...")
+			c <- struct{}{}
+			return
+		default:
+			if el.BeforeSleep != nil {
+				el.BeforeSleep()
+			}
+			_, err := el.poll(ELFlagsAllEvents | ELFlagsNoWait | ELFlagsBarrier)
+			if err != nil {
+				Log("poll error", err)
+			}
+			if el.AfterSleep != nil {
+				el.AfterSleep()
+			}
 		}
 	}
+
 }
 
 func (el *EventLoop) AddFileEvent(f *os.File, mask uint8, procFileEvent ProcFileEvent, clientData interface{}) error {
@@ -296,4 +306,11 @@ func (el *EventLoop) processTimerEvents() int {
 
 	}
 	return numEvents
+}
+
+func (el *EventLoop) StopAndWait() {
+	c := make(chan struct{})
+	el.Stop <- c
+	<-c
+	Log("EventLoop wait stop done...")
 }
